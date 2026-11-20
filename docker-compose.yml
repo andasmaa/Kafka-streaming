@@ -1,0 +1,144 @@
+# Kafka -> Spark Structured Streaming -> Bronze/Silver/Gold on HDFS -> Hive (metastore in Postgres)
+# Everything runs in Docker, like the box in the diagram.
+services:
+
+  # ---------- SOURCE (replaces the SQL Server box) ----------
+  broker:
+    image: apache/kafka:latest
+    hostname: broker
+    container_name: broker
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:29093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_LISTENERS: "PLAINTEXT://broker:29092,CONTROLLER://broker:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on: [broker]
+    ports:
+      - "9000:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: broker:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # ---------- STORAGE: Hadoop HDFS ----------
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    ports:
+      - "9870:9870"
+    environment:
+      - CLUSTER_NAME=lakehouse
+    env_file: ./hadoop.env
+    volumes:
+      - namenode_data:/hadoop/dfs/name
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    depends_on: [namenode]
+    environment:
+      SERVICE_PRECONDITION: "namenode:9870"
+    env_file: ./hadoop.env
+    volumes:
+      - datanode_data:/hadoop/dfs/data
+
+  # ---------- HIVE: metastore (Postgres) + HiveServer2 (Beeline) ----------
+  metastore-db:
+    image: postgres:15
+    container_name: metastore-db
+    environment:
+      POSTGRES_DB: metastore
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+    volumes:
+      - metastore_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d metastore"]
+      interval: 5s
+      retries: 10
+
+  hive-metastore:
+    build: ./hive
+    image: hive-lab
+    container_name: hive-metastore
+    depends_on:
+      metastore-db:
+        condition: service_healthy
+      namenode:
+        condition: service_started
+    environment:
+      SERVICE_NAME: metastore
+      IS_RESUME: "true"
+      DB_DRIVER: postgres
+      HADOOP_USER_NAME: root
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml
+
+  hiveserver2:
+    image: hive-lab
+    container_name: hiveserver2
+    depends_on: [hive-metastore]
+    environment:
+      SERVICE_NAME: hiveserver2
+      IS_RESUME: "true"
+      HADOOP_USER_NAME: root
+    ports:
+      - "10000:10000"
+      - "10002:10002"
+    volumes:
+      - ./hive/hive-site.xml:/opt/hive/conf/hive-site.xml
+      - ./sql:/sql
+
+  # ---------- SPARK: Data Integration (streaming jobs) ----------
+  spark:
+    build: ./spark
+    image: spark-lab
+    container_name: spark
+    depends_on: [broker, namenode, hive-metastore]
+    command: sleep infinity
+    environment:
+      HADOOP_USER_NAME: root
+    ports:
+      - "4040:4040"
+    volumes:
+      - ./spark_jobs:/jobs
+
+  # ---------- SPARK: Analytics engine -> Jupyter (Data Scientist) ----------
+  jupyter:
+    image: spark-lab
+    container_name: jupyter
+    depends_on: [spark, hive-metastore, namenode]
+    command: jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --ServerApp.token='' --ServerApp.password='' --notebook-dir=/notebooks
+    environment:
+      HADOOP_USER_NAME: root
+    ports:
+      - "8888:8888"
+      - "4041:4040"
+    volumes:
+      - ./notebooks:/notebooks
+
+volumes:
+  namenode_data:
+  datanode_data:
+  metastore_pg:
+networks:
+  default:
+    name: lakehouse-net
